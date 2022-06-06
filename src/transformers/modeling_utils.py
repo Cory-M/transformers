@@ -117,19 +117,8 @@ except ImportError:
             return input
 
 
-def get_parameter_device(parameter: Union[nn.Module, GenerationMixin, "ModuleUtilsMixin"]):
-    try:
-        return next(parameter.parameters()).device
-    except StopIteration:
-        # For nn.DataParallel compatibility in PyTorch 1.5
-
-        def find_tensor_attributes(module: nn.Module) -> List[Tuple[str, Tensor]]:
-            tuples = [(k, v) for k, v in module.__dict__.items() if torch.is_tensor(v)]
-            return tuples
-
-        gen = parameter._named_members(get_members_fn=find_tensor_attributes)
-        first_tuple = next(gen)
-        return first_tuple[1].device
+def get_parameter_device(parameter):
+    return next(parameter.parameters()).device
 
 
 def get_parameter_dtype(parameter: Union[nn.Module, GenerationMixin, "ModuleUtilsMixin"]):
@@ -658,20 +647,21 @@ class ModuleUtilsMixin:
             module.mem_rss_post_forward = 0
             module.mem_rss_pre_forward = 0
 
-    @property
-    def device(self) -> device:
-        """
-        `torch.device`: The device on which the module is (assuming that all the module parameters are on the same
-        device).
-        """
-        return get_parameter_device(self)
-
-    @property
-    def dtype(self) -> torch.dtype:
-        """
-        `torch.dtype`: The dtype of the module (assuming that all the module parameters have the same dtype).
-        """
-        return get_parameter_dtype(self)
+    # TODO: need supporting these functions later.
+#    @property
+#    def device(self) -> device:
+#        """
+#        `torch.device`: The device on which the module is (assuming that all the module parameters are on the same
+#        device).
+#        """
+#        return get_parameter_device(self)
+#
+#    @property
+#    def dtype(self) -> torch.dtype:
+#        """
+#        `torch.dtype`: The dtype of the module (assuming that all the module parameters have the same dtype).
+#        """
+#        return get_parameter_dtype(self)
 
     def invert_attention_mask(self, encoder_attention_mask: Tensor) -> Tensor:
         """
@@ -946,7 +936,9 @@ class PreTrainedModel(nn.Module, ModuleUtilsMixin, GenerationMixin, PushToHubMix
         """
         `Dict[str, torch.Tensor]`: Dummy inputs to do a forward pass in the network.
         """
-        return {"input_ids": torch.tensor(DUMMY_INPUTS)}
+        # TODO: python value of type 'list' cannot be used as a value.
+        # Use the definition value of DUMMY_INPUTS to replace DUMMY_INPUTS
+        return {"input_ids": torch.tensor([[7, 6, 0, 0, 1], [1, 2, 3, 0, 0], [0, 0, 0, 4, 5]])}
 
     @property
     def framework(self) -> str:
@@ -1042,12 +1034,12 @@ class PreTrainedModel(nn.Module, ModuleUtilsMixin, GenerationMixin, PushToHubMix
         torch.set_default_dtype(dtype)
         return dtype_orig
 
-    @property
-    def base_model(self) -> nn.Module:
-        """
-        `torch.nn.Module`: The main body of the model.
-        """
-        return getattr(self, self.base_model_prefix, self)
+#    @property
+#    def base_model(self) -> nn.Module:
+#        """
+#        `torch.nn.Module`: The main body of the model.
+#        """
+#        return getattr(self, self.base_model_prefix, self)
 
     def get_input_embeddings(self) -> nn.Module:
         """
@@ -1477,7 +1469,9 @@ class PreTrainedModel(nn.Module, ModuleUtilsMixin, GenerationMixin, PushToHubMix
         Note that in other frameworks this feature can be referred to as "activation checkpointing" or "checkpoint
         activations".
         """
-        return any(hasattr(m, "gradient_checkpointing") and m.gradient_checkpointing for m in self.modules())
+        # TODO: gradient checkpointing is not supported for TorchScript
+        # set always False here.
+        return False
 
     def save_pretrained(
         self,

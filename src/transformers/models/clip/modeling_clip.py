@@ -45,6 +45,20 @@ CLIP_PRETRAINED_MODEL_ARCHIVE_LIST = [
 ]
 
 
+def _get_tensor_min(dtype: torch.dtype,
+           min16: float = torch.finfo(torch.float16).min,
+           min32: float = torch.finfo(torch.float32).min,
+           min64: float = torch.finfo(torch.float64).min,
+            ) -> float:
+    if dtype == torch.float16:
+        return min16
+    elif dtype == torch.float32:
+        return min32
+    elif dtype == torch.float64:
+        return min64
+    else:
+        raise RuntimeError(f"Expected dtype to be floating-type, got {dtype}")
+
 # Copied from transformers.models.bart.modeling_bart._expand_mask
 def _expand_mask(mask: torch.Tensor, dtype: torch.dtype, tgt_len: Optional[int] = None):
     """
@@ -56,8 +70,9 @@ def _expand_mask(mask: torch.Tensor, dtype: torch.dtype, tgt_len: Optional[int] 
     expanded_mask = mask[:, None, None, :].expand(bsz, 1, tgt_len, src_len).to(dtype)
 
     inverted_mask = 1.0 - expanded_mask
+    inverted_mask_bool = (inverted_mask == 1)
 
-    return inverted_mask.masked_fill(inverted_mask.to(torch.bool), torch.finfo(dtype).min)
+    return inverted_mask.masked_fill(inverted_mask_bool, _get_tensor_min(dtype))
 
 
 # contrastive loss function, adapted from
@@ -156,13 +171,22 @@ class CLIPTextEmbeddings(nn.Module):
         position_ids: Optional[torch.LongTensor] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
     ) -> torch.Tensor:
-        seq_length = input_ids.shape[-1] if input_ids is not None else inputs_embeds.shape[-2]
+        if input_ids is not None:
+            seq_length = input_ids.shape[-1]
+        elif inputs_embeds is not None:
+            seq_length = inputs_embeds.shape[-2]
+        else:
+            raise TypeError
+#        seq_length = input_ids.shape[-1] if input_ids is not None else inputs_embeds.shape[-2]
 
         if position_ids is None:
             position_ids = self.position_ids[:, :seq_length]
 
         if inputs_embeds is None:
-            inputs_embeds = self.token_embedding(input_ids)
+            if input_ids is not None:
+                inputs_embeds = self.token_embedding(input_ids)
+            else:
+                raise TypeError
 
         position_embeddings = self.position_embedding(position_ids)
         embeddings = inputs_embeds + position_embeddings
@@ -201,7 +225,7 @@ class CLIPAttention(nn.Module):
         attention_mask: Optional[torch.Tensor] = None,
         causal_attention_mask: Optional[torch.Tensor] = None,
         output_attentions: Optional[bool] = False,
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         """Input shape: Batch x Time x Channel"""
 
         bsz, tgt_len, embed_dim = hidden_states.size()
@@ -245,7 +269,7 @@ class CLIPAttention(nn.Module):
 
         attn_weights = nn.functional.softmax(attn_weights, dim=-1)
 
-        if output_attentions:
+        if output_attentions is not None and output_attentions == True:
             # this operation is a bit akward, but it's required to
             # make sure that attn_weights keeps its gradient.
             # In order to do so, attn_weights have to reshaped
@@ -301,10 +325,10 @@ class CLIPEncoderLayer(nn.Module):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        attention_mask: torch.Tensor,
-        causal_attention_mask: torch.Tensor,
+        attention_mask: Optional[torch.Tensor],
+        causal_attention_mask: Optional[torch.Tensor] = None,
         output_attentions: Optional[bool] = False,
-    ) -> Tuple[torch.FloatTensor]:
+    ) -> Tuple[torch.Tensor, Optional[torch.FloatTensor]]:
         """
         Args:
             hidden_states (`torch.FloatTensor`): input to the layer of shape `(batch, seq_len, embed_dim)`
@@ -331,12 +355,11 @@ class CLIPEncoderLayer(nn.Module):
         hidden_states = self.mlp(hidden_states)
         hidden_states = residual + hidden_states
 
-        outputs = (hidden_states,)
-
-        if output_attentions:
-            outputs += (attn_weights,)
-
-        return outputs
+        if output_attentions is not None and output_attentions:
+            assert attn_weights is not None
+            return hidden_states, attn_weights
+        else:
+            return (hidden_states, None)
 
 
 class CLIPPreTrainedModel(PreTrainedModel):
@@ -503,11 +526,17 @@ class CLIPEncoder(nn.Module):
         config: CLIPConfig
     """
 
-    def __init__(self, config: CLIPConfig):
+    def __init__(self, config):
         super().__init__()
         self.config = config
         self.layers = nn.ModuleList([CLIPEncoderLayer(config) for _ in range(config.num_hidden_layers)])
         self.gradient_checkpointing = False
+   
+    def create_custom_forward(self, module, output_attentions):
+        def custom_forward(*inputs):
+            return module(*inputs, output_attentions)
+        return custom_forward
+
 
     def forward(
         self,
@@ -517,7 +546,7 @@ class CLIPEncoder(nn.Module):
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
-    ) -> Union[Tuple, BaseModelOutput]:
+        ) -> Tuple[torch.Tensor]:
         r"""
         Args:
             inputs_embeds (`torch.FloatTensor` of shape `(batch_size, sequence_length, hidden_size)`):
@@ -553,27 +582,21 @@ class CLIPEncoder(nn.Module):
         )
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
-        encoder_states = () if output_hidden_states else None
+        # TODO
+        # attention or hidden_states are vary-length lists or tensors, 
+        # Not sure how to deal with this in TorchScript yet. 
+        # Possibly need to concate the tensor list to a torch.Tensor(with varied shape).
+        if output_attentions or output_hidden_states:
+            raise NotImplementedError("output attention or hidden_states not implemented for now")
+        if return_dict:
+            raise NotImplementedError("return_dict_output not supported for torchscript model")
+
         all_attentions = () if output_attentions else None
 
         hidden_states = inputs_embeds
         for idx, encoder_layer in enumerate(self.layers):
-            if output_hidden_states:
-                encoder_states = encoder_states + (hidden_states,)
             if self.gradient_checkpointing and self.training:
-
-                def create_custom_forward(module):
-                    def custom_forward(*inputs):
-                        return module(*inputs, output_attentions)
-
-                    return custom_forward
-
-                layer_outputs = torch.utils.checkpoint.checkpoint(
-                    create_custom_forward(encoder_layer),
-                    hidden_states,
-                    attention_mask,
-                    causal_attention_mask,
-                )
+                raise NotImplementedError("gradient checkpoint not supported for torchscript")
             else:
                 layer_outputs = encoder_layer(
                     hidden_states,
@@ -584,17 +607,11 @@ class CLIPEncoder(nn.Module):
 
             hidden_states = layer_outputs[0]
 
-            if output_attentions:
-                all_attentions = all_attentions + (layer_outputs[1],)
-
-        if output_hidden_states:
-            encoder_states = encoder_states + (hidden_states,)
 
         if not return_dict:
-            return tuple(v for v in [hidden_states, encoder_states, all_attentions] if v is not None)
-        return BaseModelOutput(
-            last_hidden_state=hidden_states, hidden_states=encoder_states, attentions=all_attentions
-        )
+            return (hidden_states, ) # make sure we are returning tuple here
+        else:
+            raise NotImplementedError("return_dict_output not supported for torchscript model")
 
 
 class CLIPTextTransformer(nn.Module):
@@ -616,7 +633,7 @@ class CLIPTextTransformer(nn.Module):
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
-    ) -> Union[Tuple, BaseModelOutputWithPooling]:
+        ) -> Tuple[torch.Tensor, torch.Tensor]:
         r"""
         Returns:
 
@@ -661,16 +678,16 @@ class CLIPTextTransformer(nn.Module):
         pooled_output = last_hidden_state[torch.arange(last_hidden_state.shape[0]), input_ids.argmax(dim=-1)]
 
         if not return_dict:
-            return (last_hidden_state, pooled_output) + encoder_outputs[1:]
+            # TODO: vary-length self.encoder(CLIPEncoder) outputs should be supported later.
+            # since encoder_outputs is the output of CLIPEncoder,
+            # it is always a tuple with fixed length 1
+            # encoder_outputs[1:] will always be None
+            return (last_hidden_state, pooled_output)
+            
+        else:
+            raise NotImplementedError("return_dict not supported for torchscript for now")
 
-        return BaseModelOutputWithPooling(
-            last_hidden_state=last_hidden_state,
-            pooler_output=pooled_output,
-            hidden_states=encoder_outputs.hidden_states,
-            attentions=encoder_outputs.attentions,
-        )
-
-    def _build_causal_attention_mask(self, bsz, seq_len):
+    def _build_causal_attention_mask(self, bsz: int, seq_len: int) -> torch.Tensor:
         # lazily create causal attention mask, with full attention between the vision tokens
         # pytorch uses additive attention mask; fill with -inf
         mask = torch.empty(bsz, seq_len, seq_len)
@@ -705,7 +722,8 @@ class CLIPTextModel(CLIPPreTrainedModel):
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
-    ) -> Union[Tuple, BaseModelOutputWithPooling]:
+        ) -> Tuple[torch.Tensor, torch.Tensor]:
+        # same output as self.text_model(CLIPTextTransformer)
         r"""
         Returns:
 
@@ -752,7 +770,7 @@ class CLIPVisionTransformer(nn.Module):
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
-    ) -> Union[Tuple, BaseModelOutputWithPooling]:
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         r"""
         Returns:
 
@@ -781,14 +799,12 @@ class CLIPVisionTransformer(nn.Module):
         pooled_output = self.post_layernorm(pooled_output)
 
         if not return_dict:
-            return (last_hidden_state, pooled_output) + encoder_outputs[1:]
-
-        return BaseModelOutputWithPooling(
-            last_hidden_state=last_hidden_state,
-            pooler_output=pooled_output,
-            hidden_states=encoder_outputs.hidden_states,
-            attentions=encoder_outputs.attentions,
-        )
+            # TODO: vary-length self.encoder(CLIPEncoder) outputs should be supported later.
+            # encoder_outputs as output of self.encoder(CLIPEncoder)
+            # has tuple return of fixed length 1
+            return (last_hidden_state, pooled_output)
+        else:
+            raise NotImplementedError("return_dict not supported for TorchScript for now")
 
 
 class CLIPVisionModel(CLIPPreTrainedModel):
@@ -812,7 +828,7 @@ class CLIPVisionModel(CLIPPreTrainedModel):
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
-    ) -> Union[Tuple, BaseModelOutputWithPooling]:
+        ) -> Tuple[torch.Tensor, torch.Tensor]:
         r"""
         Returns:
 
@@ -987,7 +1003,10 @@ class CLIPModel(CLIPPreTrainedModel):
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
-    ) -> Union[Tuple, CLIPOutput]:
+      ) -> Union[
+         Tuple[Optional[torch.Tensor], torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, Tuple[torch.Tensor, torch.Tensor], Tuple[torch.Tensor, torch.Tensor]],
+         Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, Tuple[torch.Tensor, torch.Tensor], Tuple[torch.Tensor, torch.Tensor]]
+      ]:
         r"""
         Returns:
 
@@ -1050,20 +1069,17 @@ class CLIPModel(CLIPPreTrainedModel):
         logits_per_text = torch.matmul(text_embeds, image_embeds.t()) * logit_scale
         logits_per_image = logits_per_text.T
 
-        loss = None
-        if return_loss:
+        if return_loss is not None and return_loss:
             loss = clip_loss(logits_per_text)
+        else:
+            loss = None
 
         if not return_dict:
             output = (logits_per_image, logits_per_text, text_embeds, image_embeds, text_outputs, vision_outputs)
-            return ((loss,) + output) if loss is not None else output
+            if return_loss is not None and return_loss:
+                return ((loss,) + output)
+            else:
+                return output
+        else:
+            raise NotImplementedError("return_dict not supported for torchscript for now")
 
-        return CLIPOutput(
-            loss=loss,
-            logits_per_image=logits_per_image,
-            logits_per_text=logits_per_text,
-            text_embeds=text_embeds,
-            image_embeds=image_embeds,
-            text_model_output=text_outputs,
-            vision_model_output=vision_outputs,
-        )
