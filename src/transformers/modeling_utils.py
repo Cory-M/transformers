@@ -936,8 +936,11 @@ class PreTrainedModel(nn.Module, ModuleUtilsMixin, GenerationMixin, PushToHubMix
         """
         `Dict[str, torch.Tensor]`: Dummy inputs to do a forward pass in the network.
         """
-        # TODO: python value of type 'list' cannot be used as a value.
-        # Use the definition value of DUMMY_INPUTS to replace DUMMY_INPUTS
+        # TorchScript doesn't allow capturing global variables.
+        # Workaround:
+            # pass value as arguments to function
+            # use a literal constant
+        # Here we use the definition value of DUMMY_INPUTS to replace DUMMY_INPUTS
         return {"input_ids": torch.tensor([[7, 6, 0, 0, 1], [1, 2, 3, 0, 0], [0, 0, 0, 4, 5]])}
 
     @property
@@ -1471,8 +1474,12 @@ class PreTrainedModel(nn.Module, ModuleUtilsMixin, GenerationMixin, PushToHubMix
         """
         # TODO: gradient checkpointing is not supported for TorchScript
         # set always False here.
+        for m in self.modules():
+            if hasattr(m, 'gradient_checkpointing'): 
+                if m.gradient_checkpointing:
+                    return True
         return False
-
+                
     def save_pretrained(
         self,
         save_directory: Union[str, os.PathLike],
