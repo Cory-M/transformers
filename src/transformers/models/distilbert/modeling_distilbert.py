@@ -175,7 +175,7 @@ class MultiHeadSelfAttention(nn.Module):
         mask: torch.Tensor,
         head_mask: Optional[torch.Tensor] = None,
         output_attentions: bool = False,
-    ) -> Tuple[torch.Tensor, ...]:
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         """
         Parameters:
             query: torch.tensor(bs, seq_length, dim)
@@ -196,17 +196,11 @@ class MultiHeadSelfAttention(nn.Module):
 
         mask_reshp = (bs, 1, 1, k_length)
 
-        def shape(x: torch.Tensor) -> torch.Tensor:
-            """separate heads"""
-            return x.view(bs, -1, self.n_heads, dim_per_head).transpose(1, 2)
+        # model defintions in forward() not supported for torchscript 
 
-        def unshape(x: torch.Tensor) -> torch.Tensor:
-            """group heads"""
-            return x.transpose(1, 2).contiguous().view(bs, -1, self.n_heads * dim_per_head)
-
-        q = shape(self.q_lin(query))  # (bs, n_heads, q_length, dim_per_head)
-        k = shape(self.k_lin(key))  # (bs, n_heads, k_length, dim_per_head)
-        v = shape(self.v_lin(value))  # (bs, n_heads, k_length, dim_per_head)
+        q = self.q_lin(query).view(bs, -1, self.n_heads, dim_per_head).transpose(1, 2)
+        k = self.k_lin(key).view(bs, -1, self.n_heads, dim_per_head).transpose(1, 2)
+        v = self.v_lin(value).view(bs, -1, self.n_heads, dim_per_head).transpose(1, 2)
 
         q = q / math.sqrt(dim_per_head)  # (bs, n_heads, q_length, dim_per_head)
         scores = torch.matmul(q, k.transpose(2, 3))  # (bs, n_heads, q_length, k_length)
@@ -221,13 +215,13 @@ class MultiHeadSelfAttention(nn.Module):
             weights = weights * head_mask
 
         context = torch.matmul(weights, v)  # (bs, n_heads, q_length, dim_per_head)
-        context = unshape(context)  # (bs, q_length, dim)
+        context = context.transpose(1, 2).contiguous().view(bs, -1, self.n_heads * dim_per_head)
         context = self.out_lin(context)  # (bs, q_length, dim)
 
         if output_attentions:
             return (context, weights)
         else:
-            return (context,)
+            return (context, None)
 
 
 class FFN(nn.Module):
@@ -241,7 +235,10 @@ class FFN(nn.Module):
         self.activation = get_activation(config.activation)
 
     def forward(self, input: torch.Tensor) -> torch.Tensor:
-        return apply_chunking_to_forward(self.ff_chunk, self.chunk_size_feed_forward, self.seq_len_dim, input)
+        if self.chunk_size_feed_forward > 0:
+            raise NotImplementedError('chunk_to_forward not supported for torchscript yet. adjust configuration')
+        else:
+            return self.ff_chunk(input)
 
     def ff_chunk(self, input: torch.Tensor) -> torch.Tensor:
         x = self.lin1(input)
@@ -266,10 +263,10 @@ class TransformerBlock(nn.Module):
     def forward(
         self,
         x: torch.Tensor,
-        attn_mask: Optional[torch.Tensor] = None,
-        head_mask: Optional[torch.Tensor] = None,
+        attn_mask: torch.Tensor,
+        head_mask: Optional[torch.Tensor] = None, # tensor or None
         output_attentions: bool = False,
-    ) -> Tuple[torch.Tensor, ...]:
+    ) -> Tuple[Optional[torch.Tensor], torch.Tensor]:
         """
         Parameters:
             x: torch.tensor(bs, seq_length, dim)
@@ -280,7 +277,7 @@ class TransformerBlock(nn.Module):
             torch.tensor(bs, seq_length, dim) The output of the transformer block contextualization.
         """
         # Self-Attention
-        sa_output = self.attention(
+        sa_output_temp = self.attention( # using a different variable name to avoid re-assign different type for the same variable.
             query=x,
             key=x,
             value=x,
@@ -289,19 +286,20 @@ class TransformerBlock(nn.Module):
             output_attentions=output_attentions,
         )
         if output_attentions:
-            sa_output, sa_weights = sa_output  # (bs, seq_length, dim), (bs, n_heads, seq_length, seq_length)
+            sa_output, sa_weights = sa_output_temp  # (bs, seq_length, dim), (bs, n_heads, seq_length, seq_length)
         else:  # To handle these `output_attentions` or `output_hidden_states` cases returning tuples
-            assert type(sa_output) == tuple
-            sa_output = sa_output[0]
+            sa_output = sa_output_temp[0]
+            sa_weights = None # otherwise it's not defined but "used" later at L315
         sa_output = self.sa_layer_norm(sa_output + x)  # (bs, seq_length, dim)
 
         # Feed Forward Network
         ffn_output = self.ffn(sa_output)  # (bs, seq_length, dim)
         ffn_output: torch.Tensor = self.output_layer_norm(ffn_output + sa_output)  # (bs, seq_length, dim)
 
-        output = (ffn_output,)
         if output_attentions:
-            output = (sa_weights,) + output
+            output = (sa_weights, ffn_output)
+        else:
+            output = (None, ffn_output)
         return output
 
 
@@ -314,12 +312,13 @@ class Transformer(nn.Module):
     def forward(
         self,
         x: torch.Tensor,
-        attn_mask: Optional[torch.Tensor] = None,
-        head_mask: Optional[torch.Tensor] = None,
+        attn_mask: torch.Tensor,
+        head_mask: Optional[torch.Tensor] = None, # Tensor or None
         output_attentions: bool = False,
         output_hidden_states: bool = False,
         return_dict: Optional[bool] = None,
-    ) -> Union[BaseModelOutput, Tuple[torch.Tensor, ...]]:  # docstyle-ignore
+     ) -> Tuple[torch.Tensor]:
+# Using BaseModelOutput would cause 'osError: could not get source code torchscript'
         """
         Parameters:
             x: torch.tensor(bs, seq_length, dim) Input sequence embedded.
@@ -334,35 +333,25 @@ class Transformer(nn.Module):
                 Tuple of length n_layers with the attention weights from each layer
                 Optional: only if output_attentions=True
         """
-        all_hidden_states = () if output_hidden_states else None
-        all_attentions = () if output_attentions else None
 
         hidden_state = x
         for i, layer_module in enumerate(self.layer):
-            if output_hidden_states:
-                all_hidden_states = all_hidden_states + (hidden_state,)
 
-            layer_outputs = layer_module(
-                x=hidden_state, attn_mask=attn_mask, head_mask=head_mask[i], output_attentions=output_attentions
-            )
+            if head_mask is not None:
+                layer_outputs = layer_module(
+                    x=hidden_state, attn_mask=attn_mask, head_mask=head_mask[i], output_attentions=output_attentions
+                )
+            else:
+                layer_outputs = layer_module(
+                    x=hidden_state, attn_mask=attn_mask, head_mask=None, output_attentions=output_attentions
+                    )
             hidden_state = layer_outputs[-1]
 
-            if output_attentions:
-                assert len(layer_outputs) == 2
-                attentions = layer_outputs[0]
-                all_attentions = all_attentions + (attentions,)
-            else:
-                assert len(layer_outputs) == 1
+            assert (layer_outputs[0] is None)
 
-        # Add last layer
-        if output_hidden_states:
-            all_hidden_states = all_hidden_states + (hidden_state,)
-
-        if not return_dict:
-            return tuple(v for v in [hidden_state, all_hidden_states, all_attentions] if v is not None)
-        return BaseModelOutput(
-            last_hidden_state=hidden_state, hidden_states=all_hidden_states, attentions=all_attentions
-        )
+        if (return_dict is not None and return_dict) or output_hidden_states or output_attentions:
+            raise NotImplementedError('output attentions/hidden_states or return dict is not implemented yet')
+        return (hidden_state, )
 
 
 # INTERFACE FOR ENCODER AND TASK SPECIFIC MODEL #
@@ -538,7 +527,9 @@ class DistilBertModel(DistilBertPreTrainedModel):
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
-    ) -> Union[BaseModelOutput, Tuple[torch.Tensor, ...]]:
+    ) -> Tuple[torch.Tensor]:
+# Using BaseModelOutput would cause osError: 'could not get source code torchscript'
+
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
@@ -554,20 +545,34 @@ class DistilBertModel(DistilBertPreTrainedModel):
         else:
             raise ValueError("You have to specify either input_ids or inputs_embeds")
 
-        device = input_ids.device if input_ids is not None else inputs_embeds.device
+        if input_ids is not None:
+            device = input_ids.device
+        elif inputs_embeds is not None:
+            device = inputs_embeds.device
+        else:
+            raise Exception('input_ids and inputs_embeds cannot both be None')
 
         if attention_mask is None:
             attention_mask = torch.ones(input_shape, device=device)  # (bs, seq_length)
+        # attention_mask always being tensor.
 
         # Prepare head mask if needed
-        head_mask = self.get_head_mask(head_mask, self.config.num_hidden_layers)
-
+        head_mask = self.get_head_mask(head_mask, self.config.num_hidden_layers) # Tensor or None
+        """
+        head_mask is either a
+        - torch.Tensor with shape [num_hidden_layers, batch, num_heads, seq_length, seq_length], or
+        - None
+        (definition in modeling_utils.py)
+        """
         if inputs_embeds is None:
-            inputs_embeds = self.embeddings(input_ids)  # (bs, seq_length, dim)
+            if input_ids is None:
+                raise Exception('inputs_embeds and input_ids cannot both be None')
+            else:
+                inputs_embeds = self.embeddings(input_ids)  # (bs, seq_length, dim)
         return self.transformer(
             x=inputs_embeds,
             attn_mask=attention_mask,
-            head_mask=head_mask,
+            head_mask=head_mask, # Tensor or None
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
             return_dict=return_dict,
@@ -694,7 +699,7 @@ class DistilBertForSequenceClassification(DistilBertPreTrainedModel):
         self.pre_classifier = nn.Linear(config.dim, config.dim)
         self.classifier = nn.Linear(config.dim, config.num_labels)
         self.dropout = nn.Dropout(config.seq_classif_dropout)
-
+        self.relu = nn.ReLU()
         # Initialize weights and apply final processing
         self.post_init()
 
@@ -735,14 +740,19 @@ class DistilBertForSequenceClassification(DistilBertPreTrainedModel):
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
-    ) -> Union[SequenceClassifierOutput, Tuple[torch.Tensor, ...]]:
+#    ) -> Union[SequenceClassifierOutput, Tuple[torch.Tensor, ...]]:
+    ) -> torch.Tensor:
+# Using SequenceClassifierOutput will cause osError: could not get source code torchscript
         r"""
         labels (`torch.LongTensor` of shape `(batch_size,)`, *optional*):
             Labels for computing the sequence classification/regression loss. Indices should be in `[0, ...,
             config.num_labels - 1]`. If `config.num_labels == 1` a regression loss is computed (Mean-Square loss), If
             `config.num_labels > 1` a classification loss is computed (Cross-Entropy).
         """
-        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+        if torch.jit.is_scripting():
+            return_dict = False
+        else:
+            return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
         distilbert_output = self.distilbert(
             input_ids=input_ids,
@@ -752,47 +762,59 @@ class DistilBertForSequenceClassification(DistilBertPreTrainedModel):
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
             return_dict=return_dict,
-        )
+        ) # have to be a tuple with length 1
         hidden_state = distilbert_output[0]  # (bs, seq_len, dim)
         pooled_output = hidden_state[:, 0]  # (bs, dim)
         pooled_output = self.pre_classifier(pooled_output)  # (bs, dim)
-        pooled_output = nn.ReLU()(pooled_output)  # (bs, dim)
+        pooled_output = self.relu(pooled_output)  # (bs, dim)
         pooled_output = self.dropout(pooled_output)  # (bs, dim)
         logits = self.classifier(pooled_output)  # (bs, num_labels)
 
         loss = None
         if labels is not None:
-            if self.config.problem_type is None:
+            if self.config.problem_type == '':
                 if self.num_labels == 1:
                     self.config.problem_type = "regression"
                 elif self.num_labels > 1 and (labels.dtype == torch.long or labels.dtype == torch.int):
                     self.config.problem_type = "single_label_classification"
                 else:
                     self.config.problem_type = "multi_label_classification"
+            else:
+                 raise NotImplementedError('other options not implemented for scripting yet')
+            """
+            - cannot instantiate class MSELoss()/CrossEntropyLoss()/etc in a script function
+            - need to properly instantiate in __init__
+            - comment out now for simplicity
+            """
+            # torchscript having trouble to treat self.config.problem_type as string, 
+            # it's by default Tensor, even if the type is specified in the SimpleConfig().
+            # don't know re-specify the type here.
+#            if self.config.problem_type == "regression":
+#                loss_fct = MSELoss()
+#                if self.num_labels == 1:
+#                    loss = loss_fct(logits.squeeze(), labels.squeeze())
+#                else:
+#                    loss = loss_fct(logits, labels)
+#            elif self.config.problem_type == "single_label_classification":
+#                loss_fct = CrossEntropyLoss()
+#                loss = loss_fct(logits.view(-1, self.num_labels), labels.view(-1))
+#            elif self.config.problem_type == "multi_label_classification":
+#                loss_fct = BCEWithLogitsLoss()
+#                loss = loss_fct(logits, labels)
 
-            if self.config.problem_type == "regression":
-                loss_fct = MSELoss()
-                if self.num_labels == 1:
-                    loss = loss_fct(logits.squeeze(), labels.squeeze())
-                else:
-                    loss = loss_fct(logits, labels)
-            elif self.config.problem_type == "single_label_classification":
-                loss_fct = CrossEntropyLoss()
-                loss = loss_fct(logits.view(-1, self.num_labels), labels.view(-1))
-            elif self.config.problem_type == "multi_label_classification":
-                loss_fct = BCEWithLogitsLoss()
-                loss = loss_fct(logits, labels)
-
-        if not return_dict:
-            output = (logits,) + distilbert_output[1:]
-            return ((loss,) + output) if loss is not None else output
-
-        return SequenceClassifierOutput(
-            loss=loss,
-            logits=logits,
-            hidden_states=distilbert_output.hidden_states,
-            attentions=distilbert_output.attentions,
-        )
+        if (return_dict is not None and return_dict) or (loss is not None):
+            raise NotImplementedError('return_dict not supported for torchscript')
+        return logits
+#        if not return_dict:
+#            output = (logits,) + distilbert_output[1:]
+#            return ((loss,) + output) if loss is not None else output
+#
+#        return SequenceClassifierOutput(
+#            loss=loss,
+#            logits=logits,
+#            hidden_states=distilbert_output.hidden_states,
+#            attentions=distilbert_output.attentions,
+#        )
 
 
 @add_start_docstrings(
